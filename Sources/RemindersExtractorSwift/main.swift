@@ -4,114 +4,97 @@
 
 import Foundation
 import EventKit
+import ArgumentParser
 
-print("Starting Reminders Extraction...")
+@main
+struct RemindersExtractor: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Extract today's reminders to a markdown file.",
+        discussion: """
+            Extracts all reminders from your Today list and saves them to a markdown file.
+            Requires access to your Reminders, which you'll need to grant in System Settings.
+            """
+    )
+    
+    mutating func run() async throws {
+        print("Starting Reminders Extraction...")
 
-// Initialize the EventKit event store
-// This is the main entry point for accessing the Reminders database
-let eventStore = EKEventStore()
-
-// Request access to reminders
-// This will prompt the user for permission if not already granted
-// The closure is called after the user grants or denies access
-eventStore.requestAccess(to: .reminder) { granted, error in
-    guard granted else {
-        print("Access to reminders was denied")
-        if let error = error {
-            print("Error: \(error)")
-        }
-        exit(1)
-    }
-    
-    // Get all reminder lists (calendars)
-    // This includes both local lists and those synced via iCloud
-    let calendars = eventStore.calendars(for: .reminder)
-    print("Found \(calendars.count) reminder lists")
-    
-    // Create predicates to match the "Today" smart list behavior
-    // This includes:
-    // 1. Reminders due today or overdue
-    // 2. Incomplete reminders
-    let calendar = Calendar.current
-    let startDate = calendar.startOfDay(for: Date())
-    let endDate = calendar.date(byAdding: .day, value: 1, to: startDate)!
-    
-    // Get incomplete reminders that are due today or overdue
-    let predicate = eventStore.predicateForIncompleteReminders(withDueDateStarting: nil,
-                                                             ending: endDate,
-                                                             calendars: calendars)
-    
-    // Fetch reminders
-    eventStore.fetchReminders(matching: predicate) { reminders in
-        guard let reminders = reminders else {
-            print("No reminders found or error occurred")
-            exit(1)
+        // Initialize the EventKit event store
+        let eventStore = EKEventStore()
+        
+        // Request access to reminders using async/await
+        let granted = try await eventStore.requestAccess(to: .reminder)
+        guard granted else {
+            print("Access to reminders was denied")
+            throw ValidationError("Access to reminders was denied. Please grant access in System Settings > Privacy & Security > Reminders")
         }
         
-        // Convert reminders to a simpler format for output
-        // For each reminder, we extract:
-        // - name (title): The reminder text, defaulting to "Untitled" if nil
-        // - dueDate: The reminder's due date (optional)
-        // - completed: Whether the reminder is marked as done
-        // - listName: The name of the list containing this reminder
-        let reminderData = reminders.map { reminder in
-            (
-                name: reminder.title ?? "Untitled",
-                dueDate: reminder.dueDateComponents?.date,
-                completed: reminder.isCompleted,
-                listName: reminder.calendar.title
-            )
+        // Get all reminder lists (calendars) and create an immutable copy
+        let calendarsCopy = eventStore.calendars(for: .reminder).map { $0 }
+        let calendarCount = calendarsCopy.count
+        
+        print("Found \(calendarCount) reminder lists")
+        
+        // Create predicates to match the "Today" smart list behavior
+        let calendar = Calendar.current
+        let startDate = calendar.startOfDay(for: Date())
+        let endDate = calendar.date(byAdding: .day, value: 1, to: startDate)!
+        
+        // Get incomplete reminders that are due today or overdue
+        let predicate = eventStore.predicateForIncompleteReminders(withDueDateStarting: nil,
+                                                                 ending: endDate,
+                                                                 calendars: calendarsCopy)
+        
+        // Fetch reminders using async/await
+        let reminders = try await withCheckedThrowingContinuation { continuation in
+            eventStore.fetchReminders(matching: predicate) { fetchedReminders in
+                if let fetchedReminders = fetchedReminders {
+                    // Create a copy of the reminders data to avoid data races
+                    let remindersCopy = fetchedReminders.map { reminder in
+                        reminder.title ?? "Untitled"
+                    }
+                    continuation.resume(returning: remindersCopy)
+                } else {
+                    continuation.resume(throwing: NSError(domain: "RemindersExtractor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch reminders"]))
+                }
+            }
         }
         
-        // Print a summary of found reminders
-        print("Found \(reminderData.count) reminders in Today list")
+        print("Found \(reminders.count) reminders in Today list")
         
         // Create the markdown file
-        // Filename includes timestamp for uniqueness
         let timestamp = DateFormatter()
         timestamp.dateFormat = "yyyyMMdd_HHmmss"
         let filename = "today_reminders_\(timestamp.string(from: Date())).md"
         
         // Generate markdown content
-        // Format:
-        // - Title
-        // - Simple bulleted list of reminders
-        var markdown = "# Today's Reminders\n\n"
+        var markdown = "# Today's Reminders (\(reminders.count))\n\n"
         
         // Add each reminder as a bullet point
-        // For long lines, ensure they wrap nicely in markdown
-        for reminder in reminderData {
-            // Split long lines at 80 characters, preserving words
-            let words = reminder.name.split(separator: " ")
-            var currentLine = "- "
-            
-            for word in words {
-                let potentialLine = currentLine + (currentLine.hasSuffix(" ") ? "" : " ") + word
-                
-                if potentialLine.count <= 80 {
-                    currentLine = potentialLine
-                } else {
-                    markdown += currentLine + "\n"
-                    currentLine = "  " + String(word)  // Indent continuation lines
-                }
-            }
-            
-            markdown += currentLine + "\n"  // Add the last line
+        for reminder in reminders {
+            markdown += "- \(reminder)\n"
         }
         
         // Write the markdown file
-        // Uses atomic write to prevent partial files
         do {
             try markdown.write(toFile: filename, atomically: true, encoding: .utf8)
             print("Created markdown file: \(filename)")
         } catch {
             print("Error writing markdown file: \(error)")
+            throw error
         }
-        
-        exit(0)
     }
 }
 
-// Keep the script running until completion
-// This is necessary because the EventKit operations are asynchronous
-RunLoop.main.run()
+struct ValidationError: Error, CustomStringConvertible {
+    let message: String
+    
+    init(_ message: String) {
+        self.message = message
+    }
+    
+    var description: String {
+        message
+    }
+}
+

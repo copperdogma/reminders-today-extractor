@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+xcuserdata/
+*.xcodeproj/
+DerivedData/
+.swiftpm/
+Package.resolved
+today_reminders_*.md 
